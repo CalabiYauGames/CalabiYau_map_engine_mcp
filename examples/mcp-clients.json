@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "CalabiYauMapEngineStdio": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:/path/to/CalabiYau_map_engine_mcp",
+        "run",
+        "python",
+        "-m",
+        "calabiyau_map_engine_mcp",
+        "--transport",
+        "all"
+      ]
+    },
+    "CalabiYauMapEngineStreamableHttp": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_HTTP_TOKEN"
+      }
+    },
+    "CalabiYauMapEngineLegacySse": {
+      "type": "sse",
+      "url": "http://127.0.0.1:8765/sse",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_HTTP_TOKEN"
+      }
+    }
+  }
+}
