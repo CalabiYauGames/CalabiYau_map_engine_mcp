@@ -89,7 +89,7 @@ class Settings:
     host: str = field(default="127.0.0.1", init=False)
 
     def __post_init__(self) -> None:
-        if self.transport not in {"stdio", "sse", "streamable-http", "all"}:
+        if self.transport not in {"stdio", "sse", "streamable-http", "http", "all"}:
             raise ValueError("Unsupported transport.")
         if not 1 <= self.port <= 65535:
             raise ValueError("Port must be between 1 and 65535.")

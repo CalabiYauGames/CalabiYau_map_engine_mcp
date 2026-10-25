@@ -4,6 +4,7 @@ import asyncio
 import logging
 import secrets
 import socket
+import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +24,9 @@ from .config import Settings
 from .tools import create_mcp
 
 logger = logging.getLogger(__name__)
+
+# 记录服务启动时间
+_server_start_time = time.time()
 
 
 class LocalSecurity:
@@ -128,17 +132,28 @@ def create_runtime(settings: Settings) -> Runtime:
     routes = []
 
     async def healthz(_: Request) -> JSONResponse:
-        return JSONResponse(
-            {"status": "ok", "service": "calabiyau-map-engine-mcp", "version": __version__}
-        )
+        uptime = time.time() - _server_start_time
+        connected_sessions = len(registry.browsers)  # 使用 browsers 字典
+        return JSONResponse({
+            "status": "ok",
+            "service": "calabiyau-map-engine-mcp",
+            "version": __version__,
+            "uptime": uptime,
+            "instances": 1,
+            "port": settings.port,
+            "transport": settings.transport,
+            "connected_sessions": connected_sessions,
+        })
 
     async def ws_endpoint(ws: Any) -> None:
         await bridge_socket(ws, registry)
 
     routes.extend([Route("/healthz", healthz), WebSocketRoute("/bridge", ws_endpoint)])
-    if settings.transport in {"sse", "all"}:
+    # "http" is the resident shape: both HTTP transports, no stdio, so a service manager can
+    # own the process without its stdin deciding the lifetime.
+    if settings.transport in {"sse", "http", "all"}:
         routes.extend(mcp.sse_app(transport_security=security).routes)
-    if settings.transport in {"streamable-http", "all"}:
+    if settings.transport in {"streamable-http", "http", "all"}:
         streamable = mcp.streamable_http_app(
             json_response=False, max_sessions=128, transport_security=security
         )

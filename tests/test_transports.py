@@ -26,6 +26,9 @@ TOOLS = {
     "get_state",
     "list_items",
     "list_actors",
+    "list_links",
+    "connect_actors",
+    "disconnect_actors",
     "select_actors",
     "place_actor",
     "move_actors",
@@ -337,6 +340,12 @@ async def test_disabled_transports_are_not_exposed(
             assert (await client.get("/healthz")).status_code == 200
             for path in disabled_paths:
                 assert (await client.get(path)).status_code == 404
+
+
+def test_http_transport_mounts_both_http_endpoints_without_stdio() -> None:
+    settings = Settings(credentials=credentials_value(), transport="http", port=8765)
+    paths = {getattr(route, "path", "") for route in create_runtime(settings).app.app.routes}
+    assert {"/bridge", "/healthz", "/mcp", "/sse"} <= paths
 
 
 def unused_port() -> int:

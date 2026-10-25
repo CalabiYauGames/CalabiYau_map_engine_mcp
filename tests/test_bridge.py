@@ -3,7 +3,13 @@ from dataclasses import replace
 
 import pytest
 
-from calabiyau_map_engine_mcp.bridge import BridgeError, Browser, BrowserRegistry
+from calabiyau_map_engine_mcp.bridge import (
+    ACTIONS,
+    WRITE_ACTIONS,
+    BridgeError,
+    Browser,
+    BrowserRegistry,
+)
 
 
 class FakeSocket:
@@ -138,3 +144,55 @@ async def test_no_generic_action_and_no_implicit_browser_selection(settings):
     with pytest.raises(BridgeError) as caught:
         await registry.call("missing", "get_state", {})
     assert caught.value.code == "BROWSER_NOT_CONNECTED"
+
+
+def test_link_actions_are_whitelisted_with_the_expected_lock_class():
+    assert {"list_links", "connect_actors", "disconnect_actors"} <= ACTIONS
+    assert "list_links" not in WRITE_ACTIONS
+    assert {"connect_actors", "disconnect_actors"} <= WRITE_ACTIONS
+
+
+async def next_frame(socket):
+    """Bounded read: a missing frame must fail the test, not hang the suite."""
+    return await asyncio.wait_for(socket.sent.get(), timeout=1)
+
+
+async def test_list_links_is_not_serialized_by_the_write_lock(settings):
+    registry, browser, socket = await connection(settings)
+    first = asyncio.create_task(registry.call("tab", "list_links", {}))
+    second = asyncio.create_task(registry.call("tab", "list_links", {}))
+    requests = [await next_frame(socket), await next_frame(socket)]
+    assert [request["action"] for request in requests] == ["list_links", "list_links"]
+    for request in requests:
+        registry.deliver(browser, reply(request, {"links": []}))
+    assert [await first, await second] == [{"links": []}, {"links": []}]
+
+
+async def test_list_links_reaches_the_socket_while_a_write_holds_the_lock(settings):
+    registry, browser, socket = await connection(settings)
+    write = asyncio.create_task(registry.call("tab", "connect_actors", {}))
+    held = await next_frame(socket)
+    assert held["action"] == "connect_actors"
+    read = asyncio.create_task(registry.call("tab", "list_links", {}))
+    listed = await next_frame(socket)
+    assert listed["action"] == "list_links"
+    registry.deliver(browser, reply(listed, {"links": [], "total": 0}))
+    assert await read == {"links": [], "total": 0}
+    registry.deliver(browser, reply(held, {"changed": True}))
+    assert await write == {"changed": True}
+
+
+async def test_link_writes_share_one_browser_lock(settings):
+    registry, browser, socket = await connection(settings)
+    first = asyncio.create_task(registry.call("tab", "connect_actors", {}))
+    request = await next_frame(socket)
+    second = asyncio.create_task(registry.call("tab", "disconnect_actors", {}))
+    # The second write must stay queued while the first is unanswered.
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(socket.sent.get(), timeout=0.05)
+    registry.deliver(browser, reply(request))
+    await first
+    request = await next_frame(socket)
+    assert request["action"] == "disconnect_actors"
+    registry.deliver(browser, reply(request))
+    await second

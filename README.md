@@ -38,6 +38,44 @@ uv run python -m calabiyau_map_engine_mcp pair
 
 启动服务后，在更新后的 Map_Engine 中打开“设置 → MCP”，填写 `bridge_url` 和 `pairing_token`，点击“连接并配对”。首次连接可能出现浏览器的本地网络访问授权提示，需要用户手动允许。
 
+## 接入桌面客户端
+
+### 让 AI 自己装（推荐）
+
+在你的 AI 客户端里打开本项目目录，粘贴这段，把 `<MCP_REPO>` 换成实际路径：
+
+```text
+读 <MCP_REPO>/docs/ai-install.md，按里面的步骤把 CalabiYau Map Engine MCP 注册到当前客户端。
+仓库路径不对就先问我，不要猜。
+```
+
+agent 会自己判断它运行在哪个客户端、配置文件在哪、条目要不要 `type` 字段，合并写入并备份原文件，
+然后让你重启客户端、引导浏览器配对。完整步骤和客户端配置对照表见
+[docs/ai-install.md](docs/ai-install.md)；客户端读不了本地文件时，用该文件末尾的「完整版提示词」。
+
+### 用命令装
+
+```powershell
+# 只检测并打印配置，不写文件
+uv run python -m calabiyau_map_engine_mcp install
+
+# 写入已安装客户端的配置文件（写入前自动备份）
+uv run python -m calabiyau_map_engine_mcp install --apply
+
+# 写入远程传输条目，供只支持 HTTP/SSE 的客户端使用
+uv run python -m calabiyau_map_engine_mcp install --transport http --apply
+```
+
+`install` 会读取或生成凭据，打印 `bridge_url`、`pairing_token` 和各传输的配置片段，并检测
+Claude Desktop、Cursor、Trae、VS Code 是否已安装。只有加 `--apply` 才真正写入；每次写入前把原文件备份为
+`<文件名>.bak-<时间戳>`，只合并 `mcpServers` / `servers` 里的本服务条目，不动其他服务器。
+
+默认写 stdio 条目，由客户端自己拉起服务，不需要预先常驻。改用 `--transport http` 时写入的是
+`url` + `Authorization` 条目，必须先以 `--transport http` 常驻服务，否则客户端连不上。
+
+`install` 会在终端显示 `pairing_token`。这是本机凭据，不要贴到公开渠道；需要撤销时执行
+`reset-pairing` 轮换。
+
 ## 启动方式
 
 ```powershell
@@ -50,17 +88,23 @@ uv run python -m calabiyau_map_engine_mcp --transport streamable-http
 # 兼容只支持旧 HTTP+SSE 的客户端。
 uv run python -m calabiyau_map_engine_mcp --transport sse
 
+# 常驻服务：同时提供 Streamable HTTP 和旧 SSE，不接管 stdin。
+uv run python -m calabiyau_map_engine_mcp --transport http
+
 # STDIO、Streamable HTTP 和旧 SSE 同时启用。
 uv run python -m calabiyau_map_engine_mcp --transport all
 ```
+
+`http` 与 `all` 的区别只在 stdio：`all` 把 stdin EOF 当作退出信号，适合由 MCP 客户端拉起，
+或在终端前台运行；`http` 完全不读 stdin，可以直接交给服务管理器、计划任务或开机自启。
 
 也可以显式使用 `serve` 子命令。STDIO 模式同样会启动本机 WebSocket 桥接端口，但不启用 MCP 的 HTTP 端点。
 
 | 路径 | 用途 | 启用模式 |
 | --- | --- | --- |
-| `/mcp` | Streamable HTTP | `streamable-http`、`all` |
-| `/sse` | 旧 SSE 事件流入口 | `sse`、`all` |
-| `/messages/` | 旧 SSE 的消息提交端点，由 SSE 客户端自动发现 | `sse`、`all` |
+| `/mcp` | Streamable HTTP | `streamable-http`、`http`、`all` |
+| `/sse` | 旧 SSE 事件流入口 | `sse`、`http`、`all` |
+| `/messages/` | 旧 SSE 的消息提交端点，由 SSE 客户端自动发现 | `sse`、`http`、`all` |
 | `/bridge` | 浏览器 WebSocket 桥接 | 全部模式 |
 | `/healthz` | 最小健康检查 | 全部模式 |
 
@@ -78,7 +122,7 @@ Authorization: Bearer <http_token>
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--transport` | `stdio` | `stdio`、`sse`、`streamable-http` 或 `all` |
+| `--transport` | `stdio` | `stdio`、`sse`、`streamable-http`、`http` 或 `all` |
 | `--port` | `8765` | MCP HTTP 和浏览器桥接共用的本机端口 |
 | `--allowed-origin` | 见下文 | 可重复传入，追加精确的网页来源 |
 | `--config-dir` | 当前用户的应用配置目录 | 自定义凭据存储目录 |
@@ -117,13 +161,18 @@ uv run python -m calabiyau_map_engine_mcp --transport streamable-http --allowed-
 | --- | --- |
 | `list_sessions` | 列出已连接并完成配对的浏览器会话 |
 | `get_state` | 返回当前地图和编辑状态、地图会话及修订号 |
-| `list_items` | 分页查询可用物品 |
+| `list_items` | 分页查询可用物品，含 `connect_item_id`、`child_item_id` 连接契约 |
 | `list_actors` | 分页查询当前地图中的 Actor |
+| `list_links` | 分页查询连接关系：成对套件、有序编组和残留段 |
 | `select_actors` | 按编辑器 Actor 标识设置选区 |
 | `place_actor` | 在地图格子中放置物件 |
 | `move_actors` | 按格子增量移动物件 |
 | `delete_actors` | 删除指定物件 |
+| `connect_actors` | 以给定顺序把子件挂到主件下，替换原有编组 |
+| `disconnect_actors` | 断开成对套件或切断编组路径 |
 | `undo`、`redo` | 使用现有编辑器撤销和重做历史 |
+
+连接沿用编辑器自身的模型：主件的物品必须声明 `child_item_id`，子件物品必须与之相同，`child_actor_ids` 的顺序就是路径顺序。成对套件（`connect_item_id`）只能由编辑器成对放置，`connect_actors` 不接受已经是套件一半的成员，需要先 `disconnect_actors`。两种连接变更都进入编辑器的组合历史，因此 `undo`、`redo` 对它们同样有效。
 
 具体桥接消息和错误约定参见 [docs/protocol.md](docs/protocol.md)。
 
