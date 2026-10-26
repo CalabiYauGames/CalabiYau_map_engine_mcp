@@ -19,15 +19,18 @@ ACTIONS = frozenset(
         "get_state",
         "list_items",
         "list_actors",
+        "list_links",
         "select_actors",
         "place_actor",
         "move_actors",
         "delete_actors",
+        "connect_actors",
+        "disconnect_actors",
         "undo",
         "redo",
     }
 )
-WRITE_ACTIONS = ACTIONS - {"get_state", "list_items", "list_actors"}
+WRITE_ACTIONS = ACTIONS - {"get_state", "list_items", "list_actors", "list_links"}
 
 
 class BridgeError(Exception):

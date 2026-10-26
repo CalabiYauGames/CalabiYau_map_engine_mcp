@@ -1,11 +1,9 @@
 import pytest
+from harness import credentials_value
 
-from calabiyau_map_engine_mcp.config import Credentials, Settings
+from calabiyau_map_engine_mcp.config import Settings
 
 
 @pytest.fixture
 def settings():
-    return Settings(
-        credentials=Credentials(pairing_token="b" * 43, http_token="h" * 43),
-        transport="all",
-    )
+    return Settings(credentials=credentials_value(), transport="all")

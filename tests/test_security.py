@@ -59,6 +59,53 @@ def test_valid_browser_pairs_and_unregisters(settings):
     assert runtime.registry.sessions() == []
 
 
+def test_health_reports_the_transport_and_the_live_session_count(settings):
+    runtime = create_runtime(settings)
+    with TestClient(runtime.app, base_url=BASE) as client:
+        body = client.get("/healthz").json()
+        assert body["service"] == "calabiyau-map-engine-mcp"
+        assert body["transport"] == settings.transport
+        assert body["port"] == settings.port
+        assert body["instances"] == 1
+        assert body["connected_sessions"] == 0
+        assert isinstance(body["uptime"], float) and body["uptime"] >= 0
+
+        with client.websocket_connect(WS, headers={"Origin": ORIGIN}) as socket:
+            socket.send_json(
+                {
+                    "version": 1,
+                    "type": "hello",
+                    "token": settings.credentials.pairing_token,
+                    "session_id": "health-tab",
+                    "label": "Health",
+                }
+            )
+            socket.receive_json()
+            assert client.get("/healthz").json()["connected_sessions"] == 1
+
+        assert client.get("/healthz").json()["connected_sessions"] == 0
+
+
+def test_a_bridge_frame_with_the_wrong_version_closes_the_connection(settings):
+    runtime = create_runtime(settings)
+    with TestClient(runtime.app, base_url=BASE) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(WS, headers={"Origin": ORIGIN}) as socket:
+                socket.send_json(
+                    {
+                        "version": 1,
+                        "type": "hello",
+                        "token": settings.credentials.pairing_token,
+                        "session_id": "version-tab",
+                        "label": "Version",
+                    }
+                )
+                socket.receive_json()
+                socket.send_json({"version": 2, "type": "response", "id": "anything"})
+                socket.receive_json()
+        assert runtime.registry.sessions() == []
+
+
 @pytest.mark.parametrize(
     "origin,token",
     [

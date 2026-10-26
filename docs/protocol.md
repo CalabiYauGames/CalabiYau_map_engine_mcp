@@ -114,8 +114,9 @@ MCP 层除 `list_sessions` 外都要求 `browser_session_id`。Python 负责会�
 | `get_state` | 空对象 | 当前地图、`map_session_id`、`revision`、选区及总数、脏状态、编辑/忙碌/只读/预览状态、撤销能力和格子范围 |
 | `list_items` | 可选 `query`、`offset`、`limit` | `items`、`offset`、`limit`、`total` 和地图快照标记 |
 | `list_actors` | 可选 `item_id`、`selected_only`、`offset`、`limit`、`map_session_id`、`expected_revision` | `actors`、分页信息和地图快照标记 |
+| `list_links` | 可选 `actor_ids`、`kind`、`offset`、`limit`、`map_session_id`、`expected_revision` | `links`、分页信息和地图快照标记 |
 
-`get_state` 允许没有地图时返回 `map: null`、`map_session_id: null`。`list_actors` 要求先打开地图；`list_items` 要求物品目录已经加载。
+`get_state` 允许没有地图时返回 `map: null`、`map_session_id: null`。`list_actors`、`list_links` 要求先打开地图；`list_items` 要求物品目录已经加载。
 
 选区结果中的 `selection` 最多返回 `256` 个编辑器标识，`selection_count` 是实际总数，`selection_truncated` 表示是否截断。需要完整列表时，使用 `list_actors` 的 `selected_only: true` 分页查询。
 
@@ -134,7 +135,25 @@ Actor 摘要：
 | `selected` | 当前是否选中 |
 | `editable` | 是否可通过 MCP 修改，保留或投影 Actor 为 false |
 
+物品摘要中的 `connect_item_id` 是原生 `ConnectItemID`（功能套件伙伴物品，`0` 表示无），`child_item_id` 是原生 `ChildItemID`（本物品作为连接主件时接受的子件物品，`0` 表示不能作主件）。这两个字段只描述物品契约，不表示当前地图里已经存在连接。
+
 所有整数都必须是 JavaScript 安全整数。地图格子与 Three.js 场景坐标不是相同坐标体系，不得把摄像机或渲染坐标直接作为 `cell`。
+
+### 连接摘要
+
+`list_links` 返回编辑器原生的链接，`links` 每项形如：
+
+```json
+{ "kind": "group", "main_actor_id": 3, "child_actor_ids": [4, 5] }
+```
+
+| `kind` | 含义 | 写入地图 |
+| --- | --- | --- |
+| `pair` | `ConnectItemID` 功能套件的两半，伙伴物品没有建造菜单条目 | 是 |
+| `group` | `ChildItemID` 编组，`child_actor_ids` 的顺序就是路径顺序 | 是 |
+| `orphan` | 编组在某处断开后残留的编辑器修复状态，`main_actor_id` 为 `null`，`child_actor_ids` 是残留节点 | 否 |
+
+链接顺序就是编辑器的插入顺序，不做额外排序。一个 Actor 最多出现在一条链接里。预览和预制件阶段的投影链接不属于持久地图，不会出现在结果中。`actor_ids` 只按成员过滤，不校验这些标识是否存在；`kind` 只接受 `pair`、`group`、`orphan`。需要一致的多页查询时，同样用 `map_session_id` 和 `expected_revision` 钉定快照。
 
 ### 写动作的共同前提
 
@@ -157,6 +176,8 @@ Actor 摘要：
 | `place_actor` | `item_id`、`cell`，可选 `rotation_index`、`color_linear_rgb` | 新建 `actor`，未创建时为 `null` |
 | `move_actors` | `actor_ids`、整数格子增量 `delta` | 移动后的 `actors` |
 | `delete_actors` | `actor_ids` | 实际删除的 `deleted_actor_ids` |
+| `connect_actors` | `main_actor_id`、`child_actor_ids` | `links`（操作后相关链接） |
+| `disconnect_actors` | `actor_ids` | `links`（操作后相关链接） |
 | `undo` | 无 | `can_undo`、`can_redo` |
 | `redo` | 无 | `can_undo`、`can_redo` |
 
@@ -167,6 +188,14 @@ Actor 摘要：
 放置只支持目录中可独立放置的单个物件；成对套件和保留设置项不在首版范围。目标格子必须有效且空闲，不覆盖已有物件。`rotation_index` 范围 `0..3`，默认 `0`。`color_linear_rgb` 默认白色，必须是三个有限 float32 数值；对于不可染色物件使用其现有默认行为。
 
 移动沿地图格子执行，并保留现有碰撞和边界检查。删除会沿用编辑器的成对关系处理，可能同时删除关联物件，因此以实际返回的标识列表为准。
+
+`connect_actors` 直接调用编辑器的连接操作：主件的物品必须声明 `child_item_id`，每个子件的物品必须等于该值，`child_actor_ids` 的顺序就是编组路径顺序，`1..256` 个且不得重复、不得包含主件。它是**替换式**的——原来属于别的编组的成员会迁移过来，被切掉的旧成员如果还有连续段，会变成 `orphan` 出现在本次返回的 `links` 里。原生连接会给还没有 `actorId` 的成员分配一个，这是编辑器保存编组所必需的。
+
+请求的编组已经成立时，浏览器不再执行一次空变更：不新增历史记录、不递增修订号、不清空重做栈，直接返回 `changed: false`。因此按同一组参数重复调用是安全的。
+
+成对套件（`pair`）不能通过 `connect_actors` 建立：伙伴物品没有建造菜单条目，只能由编辑器成对放置。`connect_actors` 也会拒绝任何已经处于 `pair` 中的成员，因为原生重建会静默丢弃那条 pair 链接，留下无法单独存在的伙伴物件；需要拆开时先调用 `disconnect_actors`。
+
+`disconnect_actors` 调用编辑器的断开操作：`pair` 整条丢弃但两个 Actor 都保留，`group` 在断开处切段，断点之后的连续段变成 `orphan`。返回的 `links` 覆盖操作前涉及这些标识的全部成员，所以切出来的残留段也在其中。对本来没有任何链接的 Actor 调用是合法的无变化操作，返回 `changed: false`。
 
 撤销和重做走现有编辑器历史，可能撤销用户之前手动完成的操作，不是 MCP 私有历史。所有动作都使用现有状态发布和渲染更新流程。
 
@@ -181,9 +210,12 @@ Actor 摘要：
 | `EDIT_MODE_REQUIRED` | 请用户在网页进入编辑模式 |
 | `READ_ONLY`、`UNSUPPORTED_PREVIEW` | 尊重编辑器限制，不通过其他入口绕过 |
 | `EDITOR_BUSY`、`BUSY` | 等待当前任务完成后重新读取状态 |
-| `CATALOG_UNAVAILABLE` | 等待或补齐编辑器物品目录 |
+| `CATALOG_UNAVAILABLE` | 等待或补齐编辑器物品目录；若地图引用了目录里不存在的物品，重试不会恢复，需要目录与地图匹配 |
 | `INVALID_PARAMS`、`ACTOR_NOT_FOUND`、`ACTOR_NOT_EDITABLE` | 修正输入或重新查询 Actor |
 | `ITEM_NOT_PLACEABLE`、`CELL_OCCUPIED`、`OUT_OF_BOUNDS`、`MOVE_REJECTED` | 根据目录和当前格子状态重新选择操作 |
+| `ITEM_NOT_CONNECTABLE`、`CHILD_ITEM_MISMATCH` | 主件不声明 `child_item_id`，或子件物品不是主件声明的子件；用 `list_items` 重新挑选 |
+| `ACTOR_IN_PAIR` | 成员是成对套件的一半；先 `disconnect_actors` 拆开，或改用另一组 Actor |
+| `CONNECT_REJECTED`、`DISCONNECT_REJECTED` | 防御性错误码，正常实现下不会出现；出现说明编辑器拒绝了已通过校验的变更，读取当前状态后重新评估 |
 | `HISTORY_FAILED` | 编辑器组合历史未能完成；读取当前状态 |
 | `UNKNOWN_ACTION`、`UNSUPPORTED_ACTION` | 不调用白名单之外的动作 |
 | `RESPONSE_LIMIT`、`INVALID_MESSAGE`、`INTERNAL_ERROR` | 减少请求范围或排查实现 |

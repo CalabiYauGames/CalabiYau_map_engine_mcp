@@ -26,12 +26,23 @@ dev = [
     "httpx2>=2.16,<3",
     "pytest>=8.3,<10",
     "pytest-asyncio>=1,<2",
+    "pytest-cov>=7,<8",
     "ruff>=0.11,<1",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live: needs a real editor tab paired with a running server (set CALABIYAU_MCP_LIVE=1)",
+]
+
+[tool.coverage.run]
+source = ["calabiyau_map_engine_mcp"]
+
+[tool.coverage.report]
+# The CLI and the uvicorn entrypoint only run in subprocesses, so they read as 0% here.
+omit = ["*/__main__.py"]
 
 [tool.ruff]
 target-version = "py311"

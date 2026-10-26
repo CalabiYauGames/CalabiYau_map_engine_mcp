@@ -89,28 +89,88 @@ async def verify(url: str, directory: Path) -> None:
             assert (await read("list_actors"))["total"] == 1
             await write("redo")
             assert (await read("list_actors"))["total"] == 0
-            print(
-                json.dumps(
-                    {
-                        "status": "passed",
-                        "map_session_id": state["map_session_id"],
-                        "verified": [
-                            "list_sessions",
-                            "get_state",
-                            "list_items",
-                            "list_actors",
-                            "place_actor",
-                            "select_actors",
-                            "move_actors",
-                            "delete_actors",
-                            "undo",
-                            "redo",
-                            "stale_revision_rejected",
-                        ],
-                        "revision": snapshot["expected_revision"],
-                    }
-                )
+            verified = [
+                "list_sessions",
+                "get_state",
+                "list_items",
+                "list_actors",
+                "place_actor",
+                "select_actors",
+                "move_actors",
+                "delete_actors",
+                "undo",
+                "redo",
+                "stale_revision_rejected",
+            ]
+            output = {
+                "status": "passed",
+                "map_session_id": state["map_session_id"],
+                "verified": verified,
+                "revision": snapshot["expected_revision"],
+            }
+            main_item = next(
+                (
+                    entry
+                    for entry in items["items"]
+                    if entry["placeable"] and entry["child_item_id"]
+                ),
+                None,
             )
+            partners = (
+                []
+                if main_item is None
+                else [
+                    entry
+                    for entry in items["items"]
+                    if entry["placeable"] and entry["item_id"] == main_item["child_item_id"]
+                ]
+            )
+            if main_item is None or not partners:
+                output["links_skipped"] = True
+                output["links_skip_reason"] = (
+                    "no placeable catalog item declares child_item_id"
+                    if main_item is None
+                    else f"no placeable item with item_id {main_item['child_item_id']}"
+                )
+            else:
+                assert (await read("list_links"))["total"] == 0
+                placed_main = await write(
+                    "place_actor", item_id=main_item["item_id"], cell=[3, 3, 1]
+                )
+                main_actor = placed_main["actor"]["editor_id"]
+                child_actors = []
+                for cell in ([4, 3, 1], [5, 3, 1]):
+                    placed_child = await write(
+                        "place_actor", item_id=partners[0]["item_id"], cell=cell
+                    )
+                    child_actors.append(placed_child["actor"]["editor_id"])
+                connected = await write(
+                    "connect_actors", main_actor_id=main_actor, child_actor_ids=child_actors
+                )
+                assert connected["changed"]
+                assert connected["links"][0]["kind"] == "group"
+                assert connected["links"][0]["child_actor_ids"] == child_actors
+                listed = await read("list_links", actor_ids=[main_actor])
+                assert listed["total"] == 1
+                assert listed["links"][0]["main_actor_id"] == main_actor
+                assert listed["links"][0]["child_actor_ids"] == child_actors
+                await write("undo")
+                assert (await read("list_links"))["total"] == 0
+                await write("redo")
+                restored = await read("list_links")
+                assert restored["total"] == 1
+                assert restored["links"][0]["child_actor_ids"] == child_actors
+                disconnected = await write("disconnect_actors", actor_ids=[main_actor])
+                assert disconnected["changed"]
+                remaining = await read("list_links")
+                assert not any(
+                    link["main_actor_id"] == main_actor or main_actor in link["child_actor_ids"]
+                    for link in remaining["links"]
+                )
+                await write("delete_actors", actor_ids=[main_actor, *child_actors])
+                assert (await read("list_actors"))["total"] == 0
+                verified.extend(["connect_actors", "list_links", "disconnect_actors"])
+            print(json.dumps(output))
 
 
 if __name__ == "__main__":

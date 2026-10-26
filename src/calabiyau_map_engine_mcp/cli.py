@@ -13,15 +13,21 @@ from .config import DEFAULT_ORIGINS, Settings, config_directory, load_credential
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(description="Local CalabiYau Map Engine MCP/browser bridge.")
     command.add_argument(
-        "command", nargs="?", choices=["serve", "pair", "reset-pairing"], default="serve"
+        "command",
+        nargs="?",
+        choices=["serve", "pair", "reset-pairing", "install"],
+        default="serve",
     )
     command.add_argument(
-        "--transport", choices=["stdio", "sse", "streamable-http", "all"], default="stdio"
+        "--transport",
+        choices=["stdio", "sse", "streamable-http", "http", "all"],
+        default="stdio",
     )
     command.add_argument("--port", type=int, default=8765)
     command.add_argument("--allowed-origin", action="append", default=[])
     command.add_argument("--config-dir", type=Path, default=None)
     command.add_argument("--request-timeout", type=float, default=30)
+    command.add_argument("--apply", action="store_true")
     command.add_argument(
         "--log-level", choices=["debug", "info", "warning", "error"], default="info"
     )
@@ -48,6 +54,18 @@ def main() -> None:
         )
         if arguments.command in {"pair", "reset-pairing"}:
             print(json.dumps(settings.pairing_details(), indent=2, ensure_ascii=False))
+            return
+        if arguments.command == "install":
+            from .install import install
+
+            print(
+                install(
+                    settings,
+                    apply=arguments.apply,
+                    transport=arguments.transport,
+                    command=sys.executable,
+                )
+            )
             return
         from .server import serve
 
