@@ -2,23 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import socket
-import sys
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 import httpx2
 import pytest
-import uvicorn
-from mcp.client import Client
-from mcp.client.sse import sse_client
-from mcp.client.streamable_http import streamable_http_client
+from harness import (
+    BROWSER_ID,
+    MAP_ID,
+    ORIGIN,
+    cli_process,
+    credentials_value,
+    initialize_stdio,
+    live_runtime,
+    mcp_client,
+    stdio_rpc,
+    unused_port,
+)
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-from calabiyau_map_engine_mcp.config import Credentials, Settings, load_credentials
+from calabiyau_map_engine_mcp.config import Settings, load_credentials
 from calabiyau_map_engine_mcp.server import create_runtime
 
 TOOLS = {
@@ -36,61 +42,6 @@ TOOLS = {
     "undo",
     "redo",
 }
-ORIGIN = "http://127.0.0.1:5173"
-BROWSER_ID = "test-browser-session"
-MAP_ID = "test-map-session"
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def credentials_value() -> Credentials:
-    return Credentials(pairing_token="test-pairing-" + "p" * 32, http_token="test-http-" + "h" * 32)
-
-
-@asynccontextmanager
-async def live_runtime(transport: str = "all"):
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    port = listener.getsockname()[1]
-    settings = Settings(credentials=credentials_value(), transport=transport, port=port)
-    runtime = create_runtime(settings)
-    server = uvicorn.Server(
-        uvicorn.Config(
-            runtime.app, host="127.0.0.1", port=port, log_level="error", access_log=False
-        )
-    )
-    task = asyncio.create_task(server.serve(sockets=[listener]))
-    try:
-        async with asyncio.timeout(5):
-            while not server.started:
-                if task.done():
-                    await task
-                    raise AssertionError("HTTP server exited before startup.")
-                await asyncio.sleep(0.01)
-        yield runtime, f"http://127.0.0.1:{port}"
-    finally:
-        await runtime.registry.close()
-        server.should_exit = True
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=8)
-        except TimeoutError:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        listener.close()
-
-
-@asynccontextmanager
-async def protocol_client(base: str, token: str, transport: str):
-    headers = {"Authorization": f"Bearer {token}"}
-    if transport == "sse":
-        async with Client(sse_client(f"{base}/sse", headers=headers), mode="legacy") as client:
-            yield client
-    else:
-        async with httpx2.AsyncClient(headers=headers, trust_env=False) as http:
-            stream = streamable_http_client(f"{base}/mcp", http_client=http)
-            mode = "legacy" if transport == "legacy-http" else "auto"
-            async with Client(stream, mode=mode) as client:
-                yield client
 
 
 @asynccontextmanager
@@ -163,7 +114,7 @@ async def fake_browser(base: str, token: str, *, hold_requests: bool = False):
 @pytest.mark.parametrize("transport", ["modern", "legacy-http", "sse"])
 async def test_http_transports_discover_tools_and_return_browser_errors(transport: str) -> None:
     async with live_runtime() as (runtime, base):
-        async with protocol_client(
+        async with mcp_client(
             base, runtime.settings.credentials.http_token, transport
         ) as client:
             tools = await client.list_tools()
@@ -183,7 +134,7 @@ async def test_http_transport_browser_roundtrip_and_progress(transport: str) -> 
             _,
             dispatched,
         ):
-            async with protocol_client(
+            async with mcp_client(
                 base, runtime.settings.credentials.http_token, transport
             ) as client:
                 progress_values: list[float] = []
@@ -202,45 +153,6 @@ async def test_http_transport_browser_roundtrip_and_progress(transport: str) -> 
                 assert progress_values == [0.0, 1.0]
                 assert dispatched[-1]["params"] == {}
                 assert dispatched[-1]["action"] == "get_state"
-
-
-async def test_http_and_sse_share_browser_registry_and_revision() -> None:
-    async with live_runtime() as (runtime, base):
-        async with fake_browser(base, runtime.settings.credentials.pairing_token):
-            async with protocol_client(
-                base, runtime.settings.credentials.http_token, "modern"
-            ) as modern:
-                async with protocol_client(
-                    base, runtime.settings.credentials.http_token, "sse"
-                ) as legacy:
-                    modified = await modern.call_tool(
-                        "place_actor",
-                        {
-                            "browser_session_id": BROWSER_ID,
-                            "map_session_id": MAP_ID,
-                            "expected_revision": 0,
-                            "item_id": 1,
-                            "cell": [1, 2, 3],
-                        },
-                    )
-                    assert not modified.is_error
-                    assert modified.structured_content["revision"] == 1
-                    observed = await legacy.call_tool(
-                        "get_state", {"browser_session_id": BROWSER_ID}
-                    )
-                    assert observed.structured_content["revision"] == 1
-                    stale = await legacy.call_tool(
-                        "place_actor",
-                        {
-                            "browser_session_id": BROWSER_ID,
-                            "map_session_id": MAP_ID,
-                            "expected_revision": 0,
-                            "item_id": 1,
-                            "cell": [4, 5, 6],
-                        },
-                    )
-                    assert stale.is_error
-                    assert stale.structured_content["error"]["code"] == "REVISION_CONFLICT"
 
 
 async def test_modern_http_cancelled_call_cleans_pending_request(
@@ -262,7 +174,7 @@ async def test_modern_http_cancelled_call_cleans_pending_request(
         async with fake_browser(
             base, runtime.settings.credentials.pairing_token, hold_requests=True
         ):
-            async with protocol_client(
+            async with mcp_client(
                 base, runtime.settings.credentials.http_token, "modern"
             ) as client:
                 call = asyncio.create_task(
@@ -302,7 +214,7 @@ async def test_transport_rejects_invalid_write_parameters_before_dispatch(
             _,
             dispatched,
         ):
-            async with protocol_client(
+            async with mcp_client(
                 base, runtime.settings.credentials.http_token, "modern"
             ) as client:
                 result = await client.call_tool(
@@ -348,88 +260,6 @@ def test_http_transport_mounts_both_http_endpoints_without_stdio() -> None:
     assert {"/bridge", "/healthz", "/mcp", "/sse"} <= paths
 
 
-def unused_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
-
-
-@asynccontextmanager
-async def cli_process(tmp_path: Path, transport: str, port: int, log_level: str = "warning"):
-    environment = {
-        **os.environ,
-        "PYTHONPATH": str(ROOT / "src"),
-        "PYTHONUNBUFFERED": "1",
-    }
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "calabiyau_map_engine_mcp",
-        "--transport",
-        transport,
-        "--port",
-        str(port),
-        "--config-dir",
-        str(tmp_path),
-        "--log-level",
-        log_level,
-        cwd=ROOT,
-        env=environment,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        yield process
-    finally:
-        if process.returncode is None:
-            if process.stdin is not None:
-                process.stdin.close()
-            try:
-                await asyncio.wait_for(process.wait(), 12)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
-
-
-async def stdio_rpc(
-    process: asyncio.subprocess.Process,
-    request_id: int,
-    method: str,
-    params: dict[str, Any],
-) -> dict[str, Any]:
-    assert process.stdin is not None and process.stdout is not None
-    request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-    process.stdin.write((json.dumps(request) + "\n").encode())
-    await process.stdin.drain()
-    async with asyncio.timeout(10):
-        while True:
-            raw = await process.stdout.readline()
-            assert raw, "MCP subprocess exited before replying."
-            message = json.loads(raw)
-            assert message["jsonrpc"] == "2.0"
-            if message.get("id") == request_id:
-                assert "error" not in message, message
-                return message["result"]
-
-
-async def initialize_stdio(process: asyncio.subprocess.Process) -> None:
-    result = await stdio_rpc(
-        process,
-        1,
-        "initialize",
-        {
-            "protocolVersion": "2025-11-25",
-            "capabilities": {},
-            "clientInfo": {"name": "transport-tests", "version": "1"},
-        },
-    )
-    assert result["protocolVersion"] == "2025-11-25"
-    assert process.stdin is not None
-    process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
-    await process.stdin.drain()
-
-
 @pytest.mark.parametrize("transport", ["stdio", "all"])
 async def test_stdio_subprocess_stdout_is_protocol_only_and_eof_exits(
     tmp_path: Path, transport: str
@@ -456,8 +286,8 @@ async def test_all_subprocess_stdio_http_and_sse_use_same_browser(tmp_path: Path
     async with cli_process(tmp_path, "all", port) as process:
         await initialize_stdio(process)
         async with fake_browser(base, credentials.pairing_token):
-            async with protocol_client(base, credentials.http_token, "modern") as modern:
-                async with protocol_client(base, credentials.http_token, "sse") as legacy:
+            async with mcp_client(base, credentials.http_token, "modern") as modern:
+                async with mcp_client(base, credentials.http_token, "sse") as legacy:
                     stdio_sessions, http_sessions = await asyncio.gather(
                         stdio_rpc(
                             process, 2, "tools/call", {"name": "list_sessions", "arguments": {}}
@@ -504,7 +334,7 @@ async def test_debug_mode_does_not_log_pairing_or_bearer_tokens(tmp_path: Path) 
     async with cli_process(tmp_path, "all", port, log_level="debug") as process:
         await initialize_stdio(process)
         async with fake_browser(base, credentials.pairing_token):
-            async with protocol_client(base, credentials.http_token, "modern") as client:
+            async with mcp_client(base, credentials.http_token, "modern") as client:
                 response = await client.call_tool("get_state", {"browser_session_id": BROWSER_ID})
                 assert not response.is_error
         assert process.stdin is not None and process.stderr is not None

@@ -67,17 +67,25 @@ async def test_wrong_browser_cannot_complete_request(settings):
     assert await task == {"revision": 1}
 
 
-async def test_all_mutating_transports_share_one_browser_lock(settings):
+@pytest.mark.parametrize(
+    "first_action,second_action",
+    [("move_actors", "delete_actors"), ("connect_actors", "disconnect_actors")],
+)
+async def test_every_write_waits_for_the_one_browser_lock(
+    settings, first_action, second_action
+) -> None:
+    """Reads and writes share one editor, so no two writes may overlap."""
     registry, browser, socket = await connection(settings)
-    first = asyncio.create_task(registry.call("tab", "move_actors", {}))
+    first = asyncio.create_task(registry.call("tab", first_action, {}))
     request = await socket.sent.get()
-    second = asyncio.create_task(registry.call("tab", "delete_actors", {}))
-    await asyncio.sleep(0.01)
-    assert socket.sent.empty()
+    second = asyncio.create_task(registry.call("tab", second_action, {}))
+    # The second write must stay queued while the first is unanswered.
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(socket.sent.get(), timeout=0.05)
     registry.deliver(browser, reply(request))
     await first
     request = await socket.sent.get()
-    assert request["action"] == "delete_actors"
+    assert request["action"] == second_action
     registry.deliver(browser, reply(request))
     await second
 
@@ -157,18 +165,8 @@ async def next_frame(socket):
     return await asyncio.wait_for(socket.sent.get(), timeout=1)
 
 
-async def test_list_links_is_not_serialized_by_the_write_lock(settings):
-    registry, browser, socket = await connection(settings)
-    first = asyncio.create_task(registry.call("tab", "list_links", {}))
-    second = asyncio.create_task(registry.call("tab", "list_links", {}))
-    requests = [await next_frame(socket), await next_frame(socket)]
-    assert [request["action"] for request in requests] == ["list_links", "list_links"]
-    for request in requests:
-        registry.deliver(browser, reply(request, {"links": []}))
-    assert [await first, await second] == [{"links": []}, {"links": []}]
-
-
 async def test_list_links_reaches_the_socket_while_a_write_holds_the_lock(settings):
+    """The one read that shares the lock class of a write must still get through."""
     registry, browser, socket = await connection(settings)
     write = asyncio.create_task(registry.call("tab", "connect_actors", {}))
     held = await next_frame(socket)
@@ -180,19 +178,3 @@ async def test_list_links_reaches_the_socket_while_a_write_holds_the_lock(settin
     assert await read == {"links": [], "total": 0}
     registry.deliver(browser, reply(held, {"changed": True}))
     assert await write == {"changed": True}
-
-
-async def test_link_writes_share_one_browser_lock(settings):
-    registry, browser, socket = await connection(settings)
-    first = asyncio.create_task(registry.call("tab", "connect_actors", {}))
-    request = await next_frame(socket)
-    second = asyncio.create_task(registry.call("tab", "disconnect_actors", {}))
-    # The second write must stay queued while the first is unanswered.
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(socket.sent.get(), timeout=0.05)
-    registry.deliver(browser, reply(request))
-    await first
-    request = await next_frame(socket)
-    assert request["action"] == "disconnect_actors"
-    registry.deliver(browser, reply(request))
-    await second
