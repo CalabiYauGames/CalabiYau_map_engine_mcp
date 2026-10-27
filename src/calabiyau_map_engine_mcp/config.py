@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from platformdirs import user_config_path
+from platformdirs import user_config_path, user_data_path
 from pydantic import BaseModel, ConfigDict, Field
 
 DEFAULT_ORIGINS = (
@@ -49,6 +49,25 @@ def config_directory() -> Path:
     return (
         Path(override) if override else user_config_path("CalabiYauMapEngineMCP", appauthor=False)
     )
+
+
+def screenshots_directory() -> Path:
+    """Where `capture_view` writes frames.
+
+    A source checkout keeps them in `screenshots/` beside the project, which is
+    where the scripts around this repository look for them. An installed package
+    cannot write into `site-packages`, so it falls back to the per-user data
+    directory instead of failing every capture with a permission error.
+    `CALABIYAU_MCP_SCREENSHOT_DIR` overrides both.
+    """
+    override = os.environ.get("CALABIYAU_MCP_SCREENSHOT_DIR")
+    if override:
+        return Path(override).expanduser()
+    local = Path(__file__).resolve().parents[2] / "screenshots"
+    parent = local.parent
+    if parent.is_dir() and os.access(parent, os.W_OK):
+        return local
+    return user_data_path("CalabiYauMapEngineMCP", appauthor=False) / "screenshots"
 
 
 def load_credentials(directory: Path, *, rotate: bool = False) -> Credentials:

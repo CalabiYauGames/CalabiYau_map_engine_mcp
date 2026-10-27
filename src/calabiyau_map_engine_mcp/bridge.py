@@ -17,20 +17,49 @@ from .config import Settings
 ACTIONS = frozenset(
     {
         "get_state",
+        "get_camera",
+        "set_camera",
+        "capture_view",
         "list_items",
         "list_actors",
         "list_links",
+        "create_scene_object",
+        "delete_scene_object",
         "select_actors",
         "place_actor",
+        "place_actors",
+        "update_actors",
+        "polar_array",
+        "copy_actors",
         "move_actors",
         "delete_actors",
         "connect_actors",
         "disconnect_actors",
         "undo",
         "redo",
+        "upload_model",
+        "plan_model",
+        "apply_model",
+        "discard_model",
     }
 )
-WRITE_ACTIONS = ACTIONS - {"get_state", "list_items", "list_actors", "list_links"}
+# View actions read or move the camera; none of them touch the map, so they do not need the
+# write lock that keeps two map mutations from interleaving.
+WRITE_ACTIONS = ACTIONS - {
+    "get_state",
+    "get_camera",
+    "set_camera",
+    "capture_view",
+    "list_items",
+    "list_actors",
+    "list_links",
+    # A model upload appends to a buffer the browser owns, and a plan solve reads the
+    # map without touching it. Only applying the plan is a write, and holding the lock
+    # across a multi-second solve would stall every other edit behind it.
+    "upload_model",
+    "plan_model",
+    "discard_model",
+}
 
 
 class BridgeError(Exception):
@@ -58,6 +87,9 @@ class Browser:
     label: str
     origin: str
     socket: WebSocket
+    # The Host the tab used to reach us.  Capture uploads are POSTed back to the
+    # same authority, so it has to survive the handshake.
+    host: str = ""
     connected_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     last_seen: float = field(default_factory=time.monotonic)
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -230,7 +262,13 @@ async def bridge_socket(socket: WebSocket, registry: BrowserRegistry) -> None:
         if not secrets.compare_digest(hello.token, settings.credentials.pairing_token):
             await socket.close(code=1008, reason="Invalid pairing token")
             return
-        browser = Browser(hello.session_id, hello.label, origin, socket)
+        browser = Browser(
+            hello.session_id,
+            hello.label,
+            origin,
+            socket,
+            host=socket.headers.get("host") or f"127.0.0.1:{settings.port}",
+        )
         await registry.register(browser)
         await browser.send({"version": 1, "type": "welcome", "session_id": hello.session_id})
         heartbeat = asyncio.create_task(_heartbeat(browser))
