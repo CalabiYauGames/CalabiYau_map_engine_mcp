@@ -15,6 +15,8 @@ dist/
 !.env.example
 .local/
 logs/
+# capture_view writes frame dumps here; they are run artifacts, not source.
+screenshots/
 
 # docs/ 只随仓库分发 README 引用的手册、协议和架构图；
 # 评审报告、实施计划、过程记录属于本地工作文档，不进仓库。
