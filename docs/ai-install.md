@@ -2,6 +2,8 @@
 
 本文件有两个读者：上面几段是给人看的，`## 给 AI 的指令` 之后是给 agent 看的。
 
+> **配置完成后**，查看 **[modeling-guide.md](modeling-guide.md)** 了解如何让 AI 通过 MCP 工具建模。
+
 ## 给人看：怎么用
 
 1. 在你的 AI 客户端里，**打开 `CalabiYau_map_engine_mcp` 这个目录**（Trae / Cursor / Claude Code 都可以），新建一个会话。
