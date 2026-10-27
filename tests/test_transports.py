@@ -30,17 +30,38 @@ from calabiyau_map_engine_mcp.server import create_runtime
 TOOLS = {
     "list_sessions",
     "get_state",
+    "get_camera",
+    "set_camera",
+    "capture_view",
     "list_items",
     "list_actors",
     "list_links",
+    "query_space",
+    "describe_region",
+    "find_free_space",
+    "create_scene_object",
+    "delete_scene_object",
     "connect_actors",
     "disconnect_actors",
     "select_actors",
     "place_actor",
+    "place_actors",
+    "place_quad",
+    "place_quads",
+    "update_actors",
+    "copy_actors",
+    "mirror_actors",
+    "array_actors",
+    "polar_array",
+    "fill_box",
+    "fill_sphere",
     "move_actors",
     "delete_actors",
+    "delete_region",
     "undo",
     "redo",
+    "import_model",
+    "discard_model",
 }
 
 
@@ -193,6 +214,17 @@ async def test_modern_http_cancelled_call_cleans_pending_request(
                     call.cancel()
                     with suppress(asyncio.CancelledError):
                         await call
+
+
+async def test_place_actors_4096_placements_fit_under_bridge_frame_limit() -> None:
+    async with live_runtime() as (runtime, base):
+        async with fake_browser(base, runtime.settings.credentials.pairing_token) as (_, dispatched):
+            async with mcp_client(base, runtime.settings.credentials.http_token, "modern") as client:
+                placements = [{"item_id": 1, "cell": [index % 8, (index // 8) % 8, index // 64]} for index in range(4096)]
+                result = await client.call_tool("place_actors", {"browser_session_id": BROWSER_ID, "map_session_id": MAP_ID, "expected_revision": 0, "placements": placements})
+                assert not result.is_error
+                frame = json.dumps(dispatched[-1], separators=(",", ":")).encode()
+                assert len(frame) < 1024 * 1024
 
 
 @pytest.mark.parametrize(

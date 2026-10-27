@@ -93,16 +93,16 @@ def local_http_client(
     return httpx2.AsyncClient(headers=headers, timeout=timeout, auth=auth, trust_env=False)
 
 
-async def call(client, name: str, **arguments: Any) -> dict[str, Any]:
+async def call(client, tool_name: str, **arguments: Any) -> dict[str, Any]:
     """Call one tool and return its structured content, failing on a tool error."""
-    result = await client.call_tool(name, arguments)
+    result = await client.call_tool(tool_name, arguments)
     assert not result.is_error, result.structured_content
     return result.structured_content
 
 
-async def rejected(client, name: str, **arguments: Any) -> dict[str, Any]:
+async def rejected(client, tool_name: str, **arguments: Any) -> dict[str, Any]:
     """Call one tool that must fail, and return the structured error."""
-    result = await client.call_tool(name, arguments)
+    result = await client.call_tool(tool_name, arguments)
     assert result.is_error, result.structured_content
     return result.structured_content["error"]
 
