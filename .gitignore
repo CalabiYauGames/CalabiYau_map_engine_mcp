@@ -22,7 +22,9 @@ screenshots/
 # 评审报告、实施计划、过程记录属于本地工作文档，不进仓库。
 docs/*.md
 !docs/ai-install.md
+!docs/modeling-guide.md
 !docs/protocol.md
+!docs/surface-modeling.md
 
 # 根目录遗留的临时验证脚本（未被 testpaths 收集，且硬编码了旧令牌）
 /test_mcp_placement.py

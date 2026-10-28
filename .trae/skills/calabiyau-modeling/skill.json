@@ -1,0 +1,9 @@
+{
+  "name": "calabiyau-modeling",
+  "version": "1.0.0",
+  "description": "CalabiYau Map Engine 3D modeling guide for AI agents - direct MCP integration",
+  "trigger": {
+    "keywords": ["model", "modeling", "建模", "3d", "geometry", "calabiyau", "map engine", "place_actors"],
+    "auto_load": true
+  }
+}
