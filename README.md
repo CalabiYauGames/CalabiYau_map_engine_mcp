@@ -217,6 +217,8 @@ Skill 会在 AI 遇到建模关键词时自动加载。
 | `query_space` | 按包围盒查询区域内的已占用格子 |
 | `describe_region` | 区域统计、包围盒、占用率与逐层 ASCII 地图 |
 | `find_free_space` | 查找可容纳指定尺寸的空闲锚点 |
+| `validate_layout` | 只读预检一份布局，返回每个冲突的原因与修正建议，不改地图 |
+| `apply_layout` | 预检通过后整批落图；任一项冲突即整体拒绝，不写入 |
 | `select_actors` | 按编辑器 Actor 标识设置选区 |
 | `place_actor` | 在地图格子中放置单个物件，或用 `transform` 按任意姿态放置面板 |
 | `update_actors` | 改颜色、朝向、物品，或按 `location_cm`/`scale`/`rotation_degrees` 改自由姿态 |
@@ -270,6 +272,8 @@ Skill 会在 AI 遇到建模关键词时自动加载。
 ### 批量与几何工具
 
 `place_actors`、`fill_box`、`fill_sphere`、`copy_actors`、`mirror_actors`、`array_actors` 都在服务端展开成一次 `place_actors` 请求，所以一次调用只对应一次浏览器往返、一个修订号和一个撤销条目。服务端先读 `list_actors` 校验再写入，`REVISION_CONFLICT`、`EDIT_MODE_REQUIRED` 之类的失败不会留下半成品。
+
+内置的 `place_actors` 保留编辑器的逐项语义：整批在浏览器里执行，但个别物件可能因占用、越界或重复格失败，结果同时给出 `placed_actors` 与 `placement_errors`。想先确认再动手就用布局预检那一对工具——`validate_layout` 只读，不递增修订号也不产生撤销记录，逐项返回 `index`、`reason`、`cell`、`occupants` 和 `suggestion`；`apply_layout` 在同一快照上先跑一次预检，**任一冲突就整体拒绝**并返回 `LAYOUT_CONFLICT`，地图保持不变，只有全部通过才整批落图（一次修订、一条撤销记录）。需要容忍部分成功时直接用 `place_actors`；需要全或无语义时用 `apply_layout`。
 
 | 工具 | 参数 | 说明 |
 | --- | --- | --- |

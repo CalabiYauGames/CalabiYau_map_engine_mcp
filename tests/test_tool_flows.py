@@ -49,6 +49,8 @@ TOOLS = {
     "query_space",
     "describe_region",
     "find_free_space",
+    "validate_layout",
+    "apply_layout",
     "create_scene_object",
     "delete_scene_object",
     "connect_actors",
@@ -85,6 +87,7 @@ WRITE_TOOLS = TOOLS - {
     "query_space",
     "describe_region",
     "find_free_space",
+    "validate_layout",
     # Releases browser memory, never the map, so it needs no snapshot.
     "discard_model",
 }
@@ -175,6 +178,21 @@ async def test_every_tool_reaches_the_editor_over_one_connection(
         await call(client, "list_actors", browser_session_id=BROWSER_ID)
         await call(client, "list_links", browser_session_id=BROWSER_ID)
 
+        # The layout pair fans out into get_state, list_items and list_actors for
+        # preflight and reuses place_actors for the write, so neither name reaches
+        # the bridge. Both still have to be exercised end to end.
+        checked = await call(
+            client,
+            "validate_layout",
+            browser_session_id=BROWSER_ID,
+            placements=[{"item_id": 1, "cell": [4, 4, 0]}],
+        )
+        assert checked["valid"] is True and checked["applied"] is False
+        applied = await write(
+            client, "apply_layout", placements=[{"item_id": 1, "cell": [4, 4, 0]}]
+        )
+        assert applied["placed_count"] == 1
+
         main = placed_id(await place(client, 2, [0, 0, 0]))
         child = placed_id(await place(client, 3, [1, 0, 0]))
 
@@ -251,6 +269,8 @@ async def test_every_tool_reaches_the_editor_over_one_connection(
             "fill_sphere",
             "delete_region",
             "import_model",
+            "validate_layout",
+            "apply_layout",
         }) | {"place_actors", "upload_model", "plan_model", "apply_model", "discard_model"}
         assert reached == native
 
@@ -1429,6 +1449,7 @@ async def test_tools_publish_the_arguments_and_enums_a_client_needs() -> None:
             "query_space",
             "describe_region",
             "find_free_space",
+            "validate_layout",
         }
 
         for name, tool in tools.items():
@@ -1644,3 +1665,163 @@ async def test_import_model_refuses_an_ambiguous_source_and_a_missing_snapshot(
         assert no_snapshot["code"] == "INVALID_PARAMS"
         assert no_snapshot["plan_token"].startswith("upload-")
         assert [frame["action"] for frame in fake.received] == ["upload_model", "plan_model"]
+
+
+# ------------------------------------------------------------- layout preflight
+
+
+async def test_validate_layout_reports_conflicts_without_writing() -> None:
+    """Every refusal category is named, and the map plus history stay untouched."""
+    async with flow() as (client, fake):
+        seeded = fake.seed(1, [0, 0, 0])
+        before = await snapshot(client)
+        placements = [
+            {"item_id": 1, "cell": [1, 0, 0]},
+            {"item_id": 1, "cell": [1, 0, 0]},
+            {"item_id": 1, "cell": [0, 0, 0]},
+            {"item_id": 1, "cell": [8, 0, 0]},
+            {"item_id": 4, "cell": [2, 0, 0]},
+            {"item_id": 1, "cell": [3, 0, 0], "transform": {"location_cm": [50.0, 50.0, 0.0]}},
+            {"item_id": 1},
+            {"item_id": 1, "cell": [4, 0, 0], "rotation_index": 4},
+            {"item_id": 1, "transform": {"location_cm": [50.0, 50.0, 0.0]}},
+            {"item_id": 7, "transform": {
+                "location_cm": [50.0, 50.0, 0.0], "scale": [0.0, 1.0, 1.0],
+            }},
+            {"item_id": 7, "transform": {
+                "location_cm": [50.0, 50.0, 0.0], "scale": [10001.0, 1.0, 1.0],
+            }},
+        ]
+        checked = await call(
+            client,
+            "validate_layout",
+            browser_session_id=BROWSER_ID,
+            placements=placements,
+        )
+        assert checked["applied"] is False
+        assert checked["valid"] is False
+        assert checked["undo_entries_created"] == 0
+        assert checked["placement_count"] == len(placements)
+        assert [(conflict["index"], conflict["reason"]) for conflict in checked["conflicts"]] == [
+            (1, "DUPLICATE_CELL"),
+            (2, "CELL_OCCUPIED"),
+            (3, "OUT_OF_BOUNDS"),
+            (4, "ITEM_NOT_FOUND"),
+            (5, "INVALID_PARAMS"),
+            (6, "INVALID_PARAMS"),
+            (7, "INVALID_PARAMS"),
+            (8, "ITEM_NOT_FREELY_PLACEABLE"),
+            (10, "INVALID_PARAMS"),
+        ]
+        duplicate, occupied, outside = checked["conflicts"][0:3]
+        assert duplicate["cell"] == [1, 0, 0]
+        assert occupied["occupants"] == [{"editor_id": seeded, "item_id": 1}]
+        assert outside["grid"] == {"x": 8, "y": 8, "z": 4} and outside["axes"] == [0]
+        assert all(conflict["suggestion"] for conflict in checked["conflicts"])
+
+        # The preflight is read-only: same revision, same actors, no undo entry.
+        after = await snapshot(client)
+        assert after["revision"] == before["revision"]
+        assert after["can_undo"] == before["can_undo"]
+        assert (await actors(client))["total"] == 1
+        assert not any(frame["action"] == "place_actors" for frame in fake.received)
+
+
+async def test_validate_layout_clean_plan_then_apply_layout_places_one_batch() -> None:
+    async with flow() as (client, fake):
+        before = await snapshot(client)
+        placements = [
+            {"item_id": 1, "cell": [1, 0, 0], "rotation_index": 1},
+            {"item_id": 1, "cell": [2, 0, 0], "color_linear_rgb": [1.0, 0.0, 0.0]},
+            {"item_id": 7, "transform": {"location_cm": [450.0, 50.0, 0.0], "scale": [0.0, 1.0, 1.0]}},
+        ]
+        checked = await call(
+            client,
+            "validate_layout",
+            browser_session_id=BROWSER_ID,
+            map_session_id=before["map_session_id"],
+            expected_revision=before["revision"],
+            placements=placements,
+        )
+        assert checked["valid"] is True and checked["conflict_count"] == 0
+        assert checked["revision"] == before["revision"]
+        assert (await snapshot(client))["revision"] == before["revision"]
+
+        applied = await write(client, "apply_layout", placements=placements)
+        assert applied["applied"] is True
+        assert applied["atomic"] is True and applied["partial_failure"] is False
+        assert applied["placed_count"] == 3 and applied["failure_count"] == 0
+        assert applied["revision"] == before["revision"] + 1
+        assert [frame["action"] for frame in fake.received].count("place_actors") == 1
+
+        listed = await actors(client, expected_revision=applied["revision"])
+        assert sorted(tuple(actor["cell"]) for actor in listed["actors"]) == [
+            (1, 0, 0),
+            (2, 0, 0),
+            (4, 0, 0),
+        ]
+
+
+async def test_apply_layout_refuses_the_whole_plan_on_one_conflict() -> None:
+    async with flow() as (client, fake):
+        fake.seed(1, [0, 0, 0])
+        before = await snapshot(client)
+        error = await rejected(
+            client,
+            "apply_layout",
+            browser_session_id=BROWSER_ID,
+            map_session_id=before["map_session_id"],
+            expected_revision=before["revision"],
+            placements=[
+                {"item_id": 1, "cell": [1, 0, 0]},
+                {"item_id": 1, "cell": [0, 0, 0]},
+            ],
+        )
+        assert error["code"] == "LAYOUT_CONFLICT"
+        assert error["requested_count"] == 2 and error["conflict_count"] == 1
+        assert error["conflicts"][0]["index"] == 1
+        assert error["conflicts"][0]["reason"] == "CELL_OCCUPIED"
+
+        after = await snapshot(client)
+        assert after["revision"] == before["revision"]
+        assert (await actors(client))["total"] == 1
+        assert not any(frame["action"] == "place_actors" for frame in fake.received)
+
+
+async def test_apply_layout_refuses_a_stale_revision_before_writing() -> None:
+    async with flow() as (client, fake):
+        before = await snapshot(client)
+        fake.seed(1, [0, 0, 0])
+        error = await rejected(
+            client,
+            "apply_layout",
+            browser_session_id=BROWSER_ID,
+            map_session_id=before["map_session_id"],
+            expected_revision=before["revision"],
+            placements=[{"item_id": 1, "cell": [1, 0, 0]}],
+        )
+        assert error["code"] == "REVISION_CONFLICT"
+        assert error["revision"] == before["revision"] + 1
+        assert (await actors(client))["total"] == 1
+        assert not any(frame["action"] == "place_actors" for frame in fake.received)
+
+
+async def test_apply_layout_checks_the_editor_writable_flags() -> None:
+    for editor, code in (
+        ({"read_only": True}, "READ_ONLY"),
+        ({"busy": True}, "EDITOR_BUSY"),
+        ({"editing": False}, "EDIT_MODE_REQUIRED"),
+    ):
+        async with flow(**editor) as (client, fake):
+            current = await snapshot(client)
+            error = await rejected(
+                client,
+                "apply_layout",
+                browser_session_id=BROWSER_ID,
+                map_session_id=current["map_session_id"],
+                expected_revision=current["revision"],
+                placements=[{"item_id": 1, "cell": [0, 0, 0]}],
+            )
+            assert error["code"] == code
+            assert (await actors(client))["total"] == 0
+            assert not any(frame["action"] == "place_actors" for frame in fake.received)

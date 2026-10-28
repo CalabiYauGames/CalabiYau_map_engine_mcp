@@ -39,6 +39,8 @@ TOOLS = {
     "query_space",
     "describe_region",
     "find_free_space",
+    "validate_layout",
+    "apply_layout",
     "create_scene_object",
     "delete_scene_object",
     "connect_actors",

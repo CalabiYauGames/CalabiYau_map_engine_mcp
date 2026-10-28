@@ -24,6 +24,10 @@ MAX_BATCH_PLACEMENTS = 4096
 MAX_ARRAY_COUNT = 256
 MAX_SPHERE_RADIUS = 32
 MAX_REGION_VOLUME = 32768
+# Mirrors the browser's free-pose limits: location_cm is clamped to +/-1 km and
+# scale to 0..10000 per axis.
+MAX_FREE_LOCATION_CM = 1_000_000.0
+MAX_FREE_SCALE = 10_000.0
 # Item 7 (斜坡) is the only item the game stores with a full float transform, and
 # `quad_to_transform` divides by its measured 1 m x 1 m face. A quad therefore
 # always becomes an item-7 plate; naming another item would need that item's own
@@ -141,6 +145,15 @@ INSTRUCTIONS = (
     "unless overwrite is true, so import "
     "into empty space or clear the area first. Afterwards capture_view and correct what the "
     "voxel grid could not express with update_actors and place_actor transform.\n"
+    "\n"
+    "Check a layout before writing it. validate_layout reads the grid, actor occupancy "
+    "and item catalog without touching the map, so it can be run freely; it returns every "
+    "conflict with an index, cell, reason and fix hint. apply_layout then submits the same "
+    "placement list in one all-or-nothing batch: if any placement is invalid the call "
+    "returns LAYOUT_CONFLICT and writes nothing, so use it when a partially placed plan "
+    "would be worse than none. place_actors keeps the editor's per-item semantics and "
+    "reports placed_actors plus placement_errors together when a caller can tolerate a "
+    "partial batch.\n"
     "\n"
     "Failures: on REVISION_CONFLICT re-read get_state and re-plan; never resend the same write. "
     "On timeout or disconnect the outcome is unknown and the change may already have landed, so "
@@ -384,6 +397,25 @@ TOOL_DESCRIPTIONS = {
         "The scan first indexes occupied cells and only validates candidate cuboids near occupancy; "
         "the cost is based on indexed actors and candidates, not anchors multiplied by cuboid volume."
     ),
+    "validate_layout": (
+        "Preflight a structured layout without changing the map. Each placement names an "
+        "item_id and a target cell (rotation_index and color_linear_rgb optional). The check is "
+        "the same one the browser would run, so it is authoritative rather than an echo: a "
+        "client that validates with this tool and then applies with apply_layout may still see "
+        "the browser refuse a placement if the map changed in between. Returns conflicts with "
+        "the offending cell, the reason and a fix hint, and confirms that no actor was written "
+        "and no undo history was created. Read-only: no edit mode or revision required."
+    ),
+    "apply_layout": (
+        "Apply a validated layout in one atomic batch: all placements succeed, or none do. "
+        "The whole call is a single browser request, one revision and one undo entry, so a "
+        "placement that the editor refuses (an occupied cell, an out-of-bounds cell, an item "
+        "that cannot be placed, a duplicate cell) fails the entire layout and writes nothing "
+        "— there is no partial success. Run validate_layout first on the same placements, then "
+        "re-read get_state so the revision you pass is current; pass the layout untouched. "
+        "Returns the placed_actors with their editor_ids and cells, the placement_errors "
+        "(empty on success) and the resulting revision. Requires edit mode and a writable map."
+    ),
     "move_actors": (
         "Move ordinary actors by an integer cell delta — relative, not absolute. Fails with "
         "MOVE_REJECTED when the destination cells are blocked or occupied. Read the returned "
@@ -598,6 +630,214 @@ def source_ids_error(actor_ids: list[int]) -> dict[str, str] | None:
     if len(set(actor_ids)) != len(actor_ids):
         return {"code": "INVALID_PARAMS", "message": "actor_ids must not contain duplicates."}
     return None
+
+
+LAYOUT_FIXES = {
+    "INVALID_PARAMS": "Correct the field named in the message and submit the plan again.",
+    "ITEM_NOT_FOUND": "Call list_items to get a valid item_id for this catalog.",
+    "ITEM_NOT_PLACEABLE": (
+        "Choose an item with placeable true and connect_item_id 0; pair kits can only be "
+        "placed by the editor itself."
+    ),
+    "ITEM_NOT_FREELY_PLACEABLE": (
+        "Give this item a cell instead of a transform, or choose an item whose "
+        "free_transform is true."
+    ),
+    "CELL_OCCUPIED": (
+        "Pick an unoccupied cell (find_free_space) or delete the occupant first; the "
+        "occupying editor_ids are in this conflict."
+    ),
+    "DUPLICATE_CELL": "Keep one placement per cell; shift or remove the other one.",
+    "OUT_OF_BOUNDS": (
+        "Every cell axis must be within 0..grid-1; read grid from get_state and choose a cell "
+        "inside it."
+    ),
+}
+
+
+def _is_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _layout_conflict(index: int, reason: str, message: str, **details: Any) -> dict[str, Any]:
+    return {
+        "index": index,
+        "reason": reason,
+        "message": message,
+        "suggestion": LAYOUT_FIXES[reason],
+        **details,
+    }
+
+
+def _free_pose_conflict(index: int, item_id: int, transform: Any) -> dict[str, Any] | None:
+    """Check a transform against the pose limits the browser enforces."""
+    if not isinstance(transform, dict):
+        return _layout_conflict(
+            index, "INVALID_PARAMS", "transform must be an object with location_cm.",
+            item_id=item_id,
+        )
+    location = transform.get("location_cm")
+    scale = transform.get("scale", [1.0, 1.0, 1.0])
+    rotation = transform.get("rotation_degrees", [0.0, 0.0, 0.0])
+    for name, value in (
+        ("location_cm", location),
+        ("scale", scale),
+        ("rotation_degrees", rotation),
+    ):
+        if (
+            not isinstance(value, list)
+            or len(value) != 3
+            or any(not _is_number(axis) for axis in value)
+        ):
+            return _layout_conflict(
+                index, "INVALID_PARAMS",
+                f"transform.{name} must be three finite numbers.", item_id=item_id,
+            )
+    if any(abs(float(axis)) > MAX_FREE_LOCATION_CM for axis in location):
+        return _layout_conflict(
+            index, "INVALID_PARAMS",
+            f"transform.location_cm must stay within +/-{MAX_FREE_LOCATION_CM:g} cm on every axis.",
+            item_id=item_id,
+        )
+    if any(not 0.0 <= float(axis) <= MAX_FREE_SCALE for axis in scale):
+        return _layout_conflict(
+            index, "INVALID_PARAMS",
+            f"transform.scale must be 0..{MAX_FREE_SCALE:g} on every axis.", item_id=item_id,
+        )
+    return None
+
+
+def validate_placements(
+    placements: list[Any],
+    *,
+    grid: dict[str, Any],
+    catalog: dict[int, dict[str, Any]],
+    occupied: dict[tuple[int, int, int], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Check a placement list against one snapshot without writing anything.
+
+    The rules mirror the browser's per-placement checks (catalog, source shape, grid
+    bounds, duplicate cells, occupied cells, free-pose limits) so a plan that passes
+    here is the plan the editor would accept on the same revision. It cannot see a
+    change made after the snapshot, which is why apply_layout still passes
+    expected_revision and reports whatever the editor answers.
+    """
+    axis_count = [int(grid.get("x", 0)), int(grid.get("y", 0)), int(grid.get("z", 0))]
+    seen_cells: set[tuple[int, int, int]] = set()
+    conflicts: list[dict[str, Any]] = []
+    for index, placement in enumerate(placements):
+        if not isinstance(placement, dict):
+            conflicts.append(
+                _layout_conflict(index, "INVALID_PARAMS", "Each placement must be an object.")
+            )
+            continue
+        item_id = placement.get("item_id")
+        if not isinstance(item_id, int) or isinstance(item_id, bool):
+            conflicts.append(
+                _layout_conflict(index, "INVALID_PARAMS", "item_id must be an integer.")
+            )
+            continue
+        item = catalog.get(item_id)
+        if item is None:
+            conflicts.append(
+                _layout_conflict(
+                    index, "ITEM_NOT_FOUND", f"Item {item_id} is not in the item catalog.",
+                    item_id=item_id,
+                )
+            )
+            continue
+        if item.get("placeable") is False or item.get("connect_item_id"):
+            conflicts.append(
+                _layout_conflict(
+                    index, "ITEM_NOT_PLACEABLE",
+                    f"Item {item_id} cannot be placed through MCP on its own.",
+                    item_id=item_id,
+                )
+            )
+            continue
+        cell = placement.get("cell")
+        transform = placement.get("transform")
+        if (cell is None) == (transform is None):
+            conflicts.append(
+                _layout_conflict(
+                    index, "INVALID_PARAMS", "Pass exactly one of cell or transform.",
+                    item_id=item_id,
+                )
+            )
+            continue
+        if transform is not None:
+            free_transform = item.get("free_transform")
+            if free_transform is None:
+                free_transform = item.get("transform_mode") == 2
+            if not free_transform:
+                conflicts.append(
+                    _layout_conflict(
+                        index, "ITEM_NOT_FREELY_PLACEABLE",
+                        f"Item {item_id} stores a grid cell, not a free pose.",
+                        item_id=item_id,
+                    )
+                )
+                continue
+            pose = _free_pose_conflict(index, item_id, transform)
+            if pose is not None:
+                conflicts.append(pose)
+            continue
+        if (
+            not isinstance(cell, list)
+            or len(cell) != 3
+            or any(not isinstance(axis, int) or isinstance(axis, bool) for axis in cell)
+        ):
+            conflicts.append(
+                _layout_conflict(
+                    index, "INVALID_PARAMS", "cell must be three integers [x, y, z].",
+                    item_id=item_id,
+                )
+            )
+            continue
+        outside = [axis for axis in range(3) if not 0 <= cell[axis] < axis_count[axis]]
+        if outside:
+            conflicts.append(
+                _layout_conflict(
+                    index, "OUT_OF_BOUNDS",
+                    "cell is outside the map grid.",
+                    item_id=item_id, cell=list(cell), grid=dict(grid), axes=outside,
+                )
+            )
+            continue
+        key = (cell[0], cell[1], cell[2])
+        if key in seen_cells:
+            conflicts.append(
+                _layout_conflict(
+                    index, "DUPLICATE_CELL",
+                    "Two placements in this layout target the same cell.",
+                    item_id=item_id, cell=list(cell),
+                )
+            )
+            continue
+        seen_cells.add(key)
+        rotation = placement.get("rotation_index", 0)
+        if not isinstance(rotation, int) or isinstance(rotation, bool) or not 0 <= rotation <= 3:
+            conflicts.append(
+                _layout_conflict(
+                    index, "INVALID_PARAMS", "rotation_index must be 0..3.",
+                    item_id=item_id, cell=list(cell),
+                )
+            )
+            continue
+        occupants = occupied.get(key)
+        if occupants:
+            conflicts.append(
+                _layout_conflict(
+                    index, "CELL_OCCUPIED",
+                    "The target cell already holds an actor.",
+                    item_id=item_id, cell=list(cell), occupants=list(occupants),
+                )
+            )
+    return conflicts
 
 
 def ascii_layers(
@@ -895,7 +1135,107 @@ def create_mcp(registry: BrowserRegistry, captures: CaptureRelay | None = None) 
             params["offset"] += params["limit"]
         return actors, meta
 
-    async def place_cells(        browser_session_id: str,
+    async def fetch_catalog(
+        browser_session_id: str, ctx: Context
+    ) -> types.CallToolResult | tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+        """Page the whole item catalog so preflight can check item contracts."""
+        params: dict[str, Any] = {"query": "", "offset": 0, "limit": 4096}
+        catalog: dict[int, dict[str, Any]] = {}
+        meta: dict[str, Any] = {}
+        while True:
+            response = await invoke("list_items", browser_session_id, ctx, **params)
+            if response.is_error:
+                return response
+            data = json.loads(response.content[0].text) if response.content else {}
+            for item in data.get("items", []):
+                item_id = item.get("item_id")
+                if isinstance(item_id, int) and not isinstance(item_id, bool):
+                    catalog[item_id] = item
+            meta = data
+            if not data.get("items") or params["offset"] + params["limit"] >= data.get("total", 0):
+                break
+            params["offset"] += params["limit"]
+        return catalog, meta
+
+    async def layout_context(
+        browser_session_id: str,
+        ctx: Context,
+        *,
+        map_session_id: str | None,
+        expected_revision: int | None,
+    ) -> types.CallToolResult | tuple[
+        dict[str, Any], dict[int, dict[str, Any]], dict[tuple[int, int, int], list[dict[str, Any]]]
+    ]:
+        """Take one consistent snapshot for a layout check.
+
+        The state read pins the map session and revision; every following read is
+        asked for that same snapshot, so a concurrent edit turns into REVISION_CONFLICT
+        instead of mixing two map versions into one verdict.
+        """
+        state_response = await invoke("get_state", browser_session_id, ctx)
+        if state_response.is_error:
+            return state_response
+        state = json.loads(state_response.content[0].text) if state_response.content else {}
+        current_map = state.get("map_session_id")
+        if state.get("map") is None or current_map is None:
+            return result(
+                {"error": {"code": "NO_MAP", "message": "Open a map in the editor first."}},
+                error=True,
+            )
+        if map_session_id is not None and map_session_id != current_map:
+            return result(
+                {
+                    "error": {
+                        "code": "STALE_SESSION",
+                        "message": "The active map session changed; read get_state again.",
+                        "map_session_id": current_map,
+                    }
+                },
+                error=True,
+            )
+        current_revision = state.get("revision")
+        if expected_revision is not None and expected_revision != current_revision:
+            return result(
+                {
+                    "error": {
+                        "code": "REVISION_CONFLICT",
+                        "message": "The map changed; read get_state and validate the plan again.",
+                        "map_session_id": current_map,
+                        "revision": current_revision,
+                    }
+                },
+                error=True,
+            )
+        fetched = await list_all_actors(
+            browser_session_id,
+            ctx,
+            map_session_id=current_map,
+            expected_revision=current_revision,
+        )
+        if not isinstance(fetched, tuple):
+            return fetched
+        actors, _ = fetched
+        catalog = await fetch_catalog(browser_session_id, ctx)
+        if not isinstance(catalog, tuple):
+            return catalog
+        item_catalog, _ = catalog
+        occupied: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+        for actor in actors:
+            cell = actor.get("cell") or []
+            if (
+                len(cell) == 3
+                and all(isinstance(axis, int) and not isinstance(axis, bool) for axis in cell)
+            ):
+                occupied.setdefault(tuple(cell), []).append(
+                    {
+                        "editor_id": actor.get("editor_id"),
+                        "item_id": actor.get("item_id"),
+                    }
+                )
+        return state, item_catalog, occupied
+
+    async def place_cells(
+        browser_session_id: str,
         ctx: Context,
         map_session_id: str,
         revision: int,
@@ -2377,6 +2717,171 @@ def create_mcp(registry: BrowserRegistry, captures: CaptureRelay | None = None) 
             }
         )
 
+
+    @mcp.tool(annotations=read_only, description=TOOL_DESCRIPTIONS["validate_layout"])
+    async def validate_layout(
+        browser_session_id: str,
+        placements: Annotated[
+            list[dict[str, Any]],
+            Field(
+                max_length=MAX_BATCH_PLACEMENTS,
+                description=(
+                    "The same placement specs place_actors and apply_layout take: item_id plus "
+                    "either cell or a free transform, with optional rotation_index and "
+                    "color_linear_rgb."
+                ),
+            ),
+        ],
+        ctx: Context,
+        map_session_id: str | None = None,
+        expected_revision: Revision | None = None,
+    ) -> types.CallToolResult:
+        """Check a layout against the current snapshot without writing anything."""
+        snapshot = await layout_context(
+            browser_session_id,
+            ctx,
+            map_session_id=map_session_id,
+            expected_revision=expected_revision,
+        )
+        if isinstance(snapshot, types.CallToolResult):
+            return snapshot
+        state, catalog, occupied = snapshot
+        conflicts = validate_placements(
+            placements,
+            grid=state.get("grid") or {},
+            catalog=catalog,
+            occupied=occupied,
+        )
+        return result(
+            {
+                "applied": False,
+                "valid": not conflicts,
+                "map_session_id": state.get("map_session_id"),
+                "revision": state.get("revision"),
+                "grid": state.get("grid"),
+                "placement_count": len(placements),
+                "conflict_count": len(conflicts),
+                "conflicts": conflicts,
+                "undo_entries_created": 0,
+                "message": (
+                    "The layout is valid and was not written; call apply_layout with the same "
+                    "placements to place it."
+                    if not conflicts
+                    else "The layout has conflicts and was not written; fix them and validate "
+                    "again."
+                ),
+            }
+        )
+
+    @mcp.tool(annotations=modify, description=TOOL_DESCRIPTIONS["apply_layout"])
+    async def apply_layout(
+        browser_session_id: str,
+        map_session_id: str,
+        expected_revision: Revision,
+        placements: Annotated[
+            list[dict[str, Any]],
+            Field(
+                min_length=1,
+                max_length=MAX_BATCH_PLACEMENTS,
+                description=(
+                    "A layout that validate_layout accepted: item_id plus either cell or a free "
+                    "transform, with optional rotation_index and color_linear_rgb."
+                ),
+            ),
+        ],
+        ctx: Context,
+    ) -> types.CallToolResult:
+        """Apply a whole layout as one batch, refusing it entirely on any conflict."""
+        snapshot = await layout_context(
+            browser_session_id,
+            ctx,
+            map_session_id=map_session_id,
+            expected_revision=expected_revision,
+        )
+        if isinstance(snapshot, types.CallToolResult):
+            return snapshot
+        state, catalog, occupied = snapshot
+        if state.get("read_only"):
+            return result(
+                {
+                    "error": {
+                        "code": "READ_ONLY",
+                        "message": "The map is read-only; nothing was written.",
+                        "read_only_reason": state.get("read_only_reason"),
+                    }
+                },
+                error=True,
+            )
+        if state.get("busy"):
+            return result(
+                {
+                    "error": {
+                        "code": "EDITOR_BUSY",
+                        "message": "The editor is busy; wait for it to finish and re-read state.",
+                        "busy_reasons": state.get("busy_reasons"),
+                    }
+                },
+                error=True,
+            )
+        if not state.get("editing"):
+            return result(
+                {
+                    "error": {
+                        "code": "EDIT_MODE_REQUIRED",
+                        "message": "Enable edit mode in the editor (Ctrl+E) first.",
+                    }
+                },
+                error=True,
+            )
+        conflicts = validate_placements(
+            placements,
+            grid=state.get("grid") or {},
+            catalog=catalog,
+            occupied=occupied,
+        )
+        if conflicts:
+            return result(
+                {
+                    "error": {
+                        "code": "LAYOUT_CONFLICT",
+                        "message": (
+                            f"{len(conflicts)} of {len(placements)} placements cannot be applied, "
+                            "so the whole layout was refused and nothing was written."
+                        ),
+                        "map_session_id": state.get("map_session_id"),
+                        "revision": state.get("revision"),
+                        "requested_count": len(placements),
+                        "conflict_count": len(conflicts),
+                        "conflicts": conflicts,
+                    }
+                },
+                error=True,
+            )
+        batch = await place_batch(
+            browser_session_id,
+            ctx,
+            map_session_id,
+            int(state.get("revision", 0)),
+            placements,
+        )
+        if not isinstance(batch, tuple):
+            return batch
+        placed, placement_errors, revision = batch
+        return result(
+            {
+                "applied": True,
+                "atomic": not placement_errors,
+                "partial_failure": bool(placement_errors),
+                "map_session_id": map_session_id,
+                "revision": revision,
+                "requested_count": len(placements),
+                "placed_count": len(placed),
+                "failure_count": len(placement_errors),
+                "placed_actors": placed,
+                "placement_errors": placement_errors,
+                "conflicts": [],
+            }
+        )
 
     @mcp.tool(annotations=modify, description=TOOL_DESCRIPTIONS["import_model"])
     async def import_model(

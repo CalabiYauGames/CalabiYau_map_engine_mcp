@@ -244,6 +244,18 @@ Actor 摘要：
 
 撤销和重做走现有编辑器历史，可能撤销用户之前手动完成的操作，不是 MCP 私有历史。所有动作都使用现有状态发布和渲染更新流程。
 
+### 布局预检
+
+`validate_layout` 与 `apply_layout` 是**服务端组合工具**，不引入新的桥接动作：预检依次调用只读的 `get_state`、`list_items`（分页取完整目录）和 `list_actors`，应用阶段在预检通过后复用 `place_actors`。因此桥接白名单、单帧上限和写锁行为都没有变化。
+
+预检本身不写地图：不递增修订号、不产生撤销记录、不改变选区，只读快照即可安全重复调用。可选的 `map_session_id` 与 `expected_revision` 用来把 `list_items` / `list_actors` 钉在同一份快照上；给出后与写动作同样按 `STALE_SESSION` / `REVISION_CONFLICT` 校验，不给出则用当次读取的 `get_state` 结果。
+
+返回 `applied: false`、`valid`、当前 `revision`、`grid`、`placement_count`、`conflict_count`、`conflicts` 以及 `undo_entries_created: 0`。每个冲突带 `index`（对应请求数组下标）、`reason`、`message`、`suggestion`，并按原因附带 `cell`、`grid`、`axes`、`occupants`（`editor_id` 与 `item_id`）等细节。原因集合与 `place_actors` 的逐项错误一致：`INVALID_PARAMS`、`ITEM_NOT_FOUND`、`ITEM_NOT_PLACEABLE`、`ITEM_NOT_FREELY_PLACEABLE`、`OUT_OF_BOUNDS`、`CELL_OCCUPIED`，以及同一布局里指向同一格子的 `DUPLICATE_CELL`。
+
+`apply_layout` 是写动作：要求 `browser_session_id`、`map_session_id`、`expected_revision` 与编辑器 `editing=true`、`read_only=false`、`busy=false`，并先在同一快照上重跑一次预检。**任一项冲突即整体拒绝**，返回 `LAYOUT_CONFLICT`（`details` 含 `map_session_id`、`revision`、`requested_count`、`conflict_count`、`conflicts`），不发起任何 `place_actors`，地图与修订号保持不变——这就是全或无语义。
+
+预检通过后整批走一次 `place_actors`，因此仍是一次修订、一条撤销记录。若浏览器在真正写入时仍返回逐项错误（例如两次调用之间地图被手动改动），结果如实标注 `atomic: false`、`partial_failure: true`，并同时给出 `placed_actors` 与 `placement_errors`；调用方应据 `placed_count` 判断是否需要回滚。需要容忍部分成功时直接用 `place_actors`，两者的区别只是这一步前置校验与拒绝策略。
+
 ### 模型导入
 
 模型文件走四步，因为桥接单帧上限是 1 MiB，而建筑模型不是：
@@ -285,6 +297,7 @@ Actor 摘要：
 | `MODEL_PLAN_UNKNOWN` | 该 `upload_id` 还没有方案；先调用 `plan_model`，或在超时后重试同一个 id |
 | `MODEL_IMPORT_FAILED`、`MODEL_ITEM_UNSUPPORTED`、`MODEL_OUT_OF_BOUNDS` | 模型解析或解算失败、方块不在实测清单里、成品尺寸超出地图；按 `details` 调整 `resolution`、`item_ids` 或 `origin` |
 | `BATCH_TOO_LARGE` | 将 `place_actors` 拆成不超过 4096 项的批次；每个批次独立修订和撤销记录 |
+| `LAYOUT_CONFLICT` | `apply_layout` 预检发现冲突并整体拒绝，地图未被修改；按 `details.conflicts` 里每个 `index`、`reason` 与 `suggestion` 修正后重试 |
 | `ITEM_NOT_CONNECTABLE`、`CHILD_ITEM_MISMATCH` | 主件不声明 `child_item_id`，或子件物品不是主件声明的子件；用 `list_items` 重新挑选 |
 | `ACTOR_IN_PAIR` | 成员是成对套件的一半；先 `disconnect_actors` 拆开，或改用另一组 Actor |
 | `CONNECT_REJECTED`、`DISCONNECT_REJECTED` | 防御性错误码，正常实现下不会出现；出现说明编辑器拒绝了已通过校验的变更，读取当前状态后重新评估 |
