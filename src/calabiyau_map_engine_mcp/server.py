@@ -20,6 +20,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
 from .bridge import BrowserRegistry, bridge_socket
+from .capture import CaptureRelay
 from .config import Settings
 from .tools import create_mcp
 
@@ -116,13 +117,15 @@ class LocalSecurity:
 class Runtime:
     settings: Settings
     registry: BrowserRegistry
+    captures: CaptureRelay
     mcp: MCPServer
     app: ASGIApp
 
 
 def create_runtime(settings: Settings) -> Runtime:
     registry = BrowserRegistry(settings)
-    mcp = create_mcp(registry)
+    captures = CaptureRelay()
+    mcp = create_mcp(registry, captures)
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=[f"127.0.0.1:{settings.port}", f"localhost:{settings.port}"],
@@ -148,7 +151,42 @@ def create_runtime(settings: Settings) -> Runtime:
     async def ws_endpoint(ws: Any) -> None:
         await bridge_socket(ws, registry)
 
-    routes.extend([Route("/healthz", healthz), WebSocketRoute("/bridge", ws_endpoint)])
+    async def capture_upload(request: Request) -> JSONResponse:
+        """Receive one capture from the browser.
+
+        This is the road a screenshot takes instead of the 1 MiB bridge frame:
+        the tool mints a slot, the browser POSTs the raw bytes here, the tool
+        picks them up.  The id in the path is the only credential, so it is
+        single-use and expires.
+        """
+        capture_id = request.path_params["capture_id"]
+        limit = captures.max_bytes
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit() and int(declared) > limit:
+            captures.discard(capture_id)
+            return JSONResponse({"error": f"capture exceeds {limit} bytes"}, status_code=413)
+        # Read incrementally instead of `await request.body()`. The header check only
+        # binds an honest client: a chunked upload declares no length, and buffering it
+        # first would let anyone on the loopback interface grow this process until it
+        # dies -- on a route that deliberately carries no bearer token.
+        buffer = bytearray()
+        async for chunk in request.stream():
+            if len(buffer) + len(chunk) > limit:
+                captures.discard(capture_id)
+                return JSONResponse({"error": f"capture exceeds {limit} bytes"}, status_code=413)
+            buffer.extend(chunk)
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip()
+        if not captures.deliver(
+            capture_id, bytes(buffer), content_type or "application/octet-stream"
+        ):
+            return JSONResponse({"error": "unknown or expired capture slot"}, status_code=404)
+        return JSONResponse({"received": len(buffer)})
+
+    routes.extend([
+        Route("/healthz", healthz),
+        Route("/capture/{capture_id}", capture_upload, methods=["POST"]),
+        WebSocketRoute("/bridge", ws_endpoint),
+    ])
     # "http" is the resident shape: both HTTP transports, no stdio, so a service manager can
     # own the process without its stdin deciding the lifetime.
     if settings.transport in {"sse", "http", "all"}:
@@ -171,7 +209,7 @@ def create_runtime(settings: Settings) -> Runtime:
             await registry.close()
 
     app = LocalSecurity(Starlette(routes=routes, lifespan=lifespan), settings)
-    return Runtime(settings, registry, mcp, app)
+    return Runtime(settings, registry, captures, mcp, app)
 
 
 async def serve(settings: Settings, *, log_level: str = "info") -> None:
